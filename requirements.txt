@@ -1,0 +1,9 @@
+dash
+fabric
+mesa
+numpy
+pandas
+plotly
+scikit-learn
+scipy
+PyYAML

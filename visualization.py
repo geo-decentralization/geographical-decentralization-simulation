@@ -1,0 +1,816 @@
+import argparse
+import dash
+import json
+import math
+import pandas as pd
+import plotly.graph_objects as go
+
+from collections import Counter, defaultdict
+from dash import State, dcc, html
+from dash.dependencies import Input, Output
+from sklearn.neighbors import NearestNeighbors
+
+# Assuming these are available in your environment
+from distribution import *
+from measure import *
+
+from dash import callback_context
+import urllib.request
+import os
+
+
+class SphericalSpace:
+    """
+    Sample points on (or near) the unit sphere.
+    distance() returns geodesic distance (great-circle distance).
+    """
+    def distance(self, p1, p2):
+        """
+        Calculates the geodesic distance between two points on a unit sphere.
+        Distance = arc length = arccos(dot(p1,p2)).
+        """
+        dotp = p1[0] * p2[0] + p1[1] * p2[1] + p1[2] * p2[2]
+        # Numerical safety clamp for dot product to be within [-1, 1] due to floating point inaccuracies
+        dotp = max(-1.0, min(1.0, dotp))
+        return math.acos(dotp)
+
+
+    def get_area(self):
+        """Returns the surface area of a unit sphere."""
+        return 4 * np.pi
+
+
+def init_distance_matrix(positions, space):
+    """
+    Build the initial distance matrix for all node pairs.
+    Returns a 2D list (or NumPy array) of shape (n, n).
+    """
+    n = len(positions)
+    dist_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = space.distance(positions[i], positions[j])
+            dist_matrix[i][j] = d
+            dist_matrix[j][i] = d  # Symmetric matrix
+    return dist_matrix
+
+
+space = SphericalSpace()
+
+
+# --- Pre-load Data ---
+def load_data(file_path):
+    """Load the slot data from a JSON file."""
+    try:
+        with open(file_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Error: {file_path} not found. Please run the simulation first.")
+        return []
+
+
+def latlon_to_xyz(lat, lon):
+    """Convert in‐place, as before."""
+    phi = math.radians(lat)
+    theta = math.radians(lon)
+    return (
+        math.cos(phi) * math.cos(theta),
+        math.cos(phi) * math.sin(theta),
+        math.sin(phi),
+    )
+
+
+def create_app(
+    all_slot_data, info_data, mev_series, attest_series, failed_block_proposals, proposal_time_series, validator_agent_regions, validator_agent_countries, info_names
+):
+    n_slots = len(all_slot_data)
+
+    # ---------------------------------------------------------
+    #  1.  Pre-compute per-slot metric history (once)
+    # ---------------------------------------------------------
+    (
+        clusters_hist,
+        total_dist_hist,
+        avg_nnd_hist,
+        nni_hist,
+        mev_hist,
+        attest_hist,
+        proposal_time_hist
+    ) = ([], [], [], [], [], [], [])
+
+    granularity = 10
+    # placeholders for “last seen” metrics
+    last_c = last_t = last_a = last_nni = last_mev = last_attest = (
+        last_proposal_time
+    ) = 0.0
+
+    # relay data
+    relay_dist = []
+    relay_positions = info_data[0] if info_data else []
+    relay_dist_per_slot = []
+
+    for i, pts in enumerate(all_slot_data):
+        if i % granularity == 0:
+            # do the full n×n compute only on multiples of `granularity`
+            dm = init_distance_matrix(
+                pts, space  # , gcp_zones=gcp_zones, gcp_latency=gcp_latency
+            )
+            if len(pts) > 1:
+                last_c = cluster_matrix(dm)
+                last_t = total_distance(dm)
+                last_a = average_nearest_neighbor_distance(dm)
+                last_nni = nearest_neighbor_index_spherical(dm, space)[0]
+                last_mev = sum(mev_series[i]) if mev_series else 0.0
+                last_attest = sum(attest_series[i])
+                last_proposal_time = (
+                    sum(t for t in proposal_time_series[i] if t > 0)
+                    if proposal_time_series[i]
+                    else 0.0
+                )
+
+                relay_dist_per_slot = [
+                    sum([space.distance(pt, relay_pos) for pt in pts]) / len(pts)
+                    for relay_pos in relay_positions
+                ]
+
+            else:
+                last_c = 0
+                last_t = last_a = last_nni = last_mev = last_attest = (
+                    last_proposal_time
+                ) = 0.0
+                relay_dist_per_slot = [0.0] * len(relay_positions)
+
+        # *every* slot, append whatever the “last computed” values are
+        clusters_hist.append(last_c)
+        total_dist_hist.append(last_t)
+        avg_nnd_hist.append(last_a)
+        nni_hist.append(last_nni)
+        mev_hist.append(last_mev)
+        attest_hist.append(last_attest)
+        proposal_time_hist.append(last_proposal_time)
+        relay_dist.append(relay_dist_per_slot)
+
+    # ---------------------------------------------------------
+    #  2.  Helper: build the 3-D density + relay figure
+    # ---------------------------------------------------------
+    def build_density_fig(points, relay_pts, dark_mode_enabled):
+        # ----- local density via fixed-radius neighbours -----
+        if points:
+            radius = 0.2
+            nbrs = NearestNeighbors(radius=radius, algorithm="ball_tree").fit(points)
+            neigh = nbrs.radius_neighbors(points, return_distance=False)
+            density = np.array([len(n) - 1 for n in neigh], dtype=float)
+            density = np.clip(density, 0, None)
+            x, y, z = zip(*points)
+        else:  # shouldn’t happen, but be safe
+            density = []
+            x = y = z = []
+
+        colorscale_density = "Viridis" if not dark_mode_enabled else "Plasma"
+
+        fig = go.Figure(
+            go.Scatter3d(
+                x=x,
+                y=y,
+                z=z,
+                mode="markers",
+                marker=dict(
+                    size=4,
+                    color=density,
+                    colorscale=colorscale_density,
+                    showscale=True,
+                    colorbar=dict(
+                        title="Local Density",
+                        # push the colorbar out of the way:
+                        x=1.15,  # → 115% of the plot width
+                        y=0.5,  # center vertically
+                        len=0.7,  # 70% of the plot height
+                        title_font_color=(
+                            "#f0f0f0" if dark_mode_enabled else "black"
+                        ),  # Colorbar title
+                        tickfont_color=(
+                            "#f0f0f0" if dark_mode_enabled else "black"
+                        ),  # Colorbar ticks                    ),
+                    ),
+                ),
+                name="Validators",
+            )
+        )
+
+        # now – add a low-opacity wireframe sphere
+        phi = np.linspace(0, np.pi, 40)
+        theta = np.linspace(0, 2 * np.pi, 80)
+        phi, theta = np.meshgrid(phi, theta)
+
+        # unit‐sphere coordinates
+        xs = np.sin(phi) * np.cos(theta)
+        ys = np.sin(phi) * np.sin(theta)
+        zs = np.cos(phi)
+
+        sphere_color = "lightblue" if not dark_mode_enabled else "#444444"
+
+        fig.add_trace(
+            go.Surface(
+                x=xs,
+                y=ys,
+                z=zs,
+                showscale=False,
+                opacity=0.2,
+                colorscale=[[0, sphere_color], [1, sphere_color]],  # uniform light‐blue
+                name="Earth",
+                hoverinfo="skip",
+            )
+        )
+        # Load GeoJSON of countries (low‐res version for speed)
+        if not os.path.exists("./data/world_countries.geo.json"):
+            url = "https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json"
+            with urllib.request.urlopen(url) as resp:
+                world = json.load(resp)
+                # Save the world data to a local file for future use
+                with open("./data/world_countries.geo.json", "w") as f:
+                    json.dump(world, f)
+        else:
+            with open("./data/world_countries.geo.json", "r") as f:
+                world = json.load(f)
+
+        country_line_color = "white" if not dark_mode_enabled else "#888888"
+
+        # add country boundary lines
+        for feature in world["features"]:
+            geom = feature["geometry"]
+            # handle both Polygons and MultiPolygons
+            polygons = geom["coordinates"]
+            if geom["type"] == "Polygon":
+                polygons = [polygons]
+            for poly in polygons:
+                # each poly is a list of rings; we only need the outer ring (first)
+                ring = poly[0]
+                lons, lats = zip(*ring)
+                # convert to xyz
+                xyz = [latlon_to_xyz(lat, lon) for lat, lon in zip(lats, lons)]
+                xs, ys, zs = map(list, zip(*xyz))
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=xs,
+                        y=ys,
+                        z=zs,
+                        mode="lines",
+                        line=dict(color=country_line_color, width=1),
+                        hoverinfo="skip",
+                        showlegend=False,
+                    )
+                )
+
+        # ----- overlay relay position(s) ---------------------
+        if relay_pts:
+            # promote single tuple to list-of-tuple
+            if isinstance(relay_pts[0], (int, float)):
+                relay_pts = [relay_pts]
+            rx, ry, rz = zip(*relay_pts)
+            fig.add_trace(
+                go.Scatter3d(
+                    x=rx,
+                    y=ry,
+                    z=rz,
+                    mode="markers+text",
+                    marker=dict(
+                        size=5,
+                        color="red",
+                        symbol="diamond",
+                        line=dict(color="black", width=1),
+                    ),
+                    text=info_names,
+                    textposition="top center",
+                    name="Info Source",
+                )
+            )
+
+        # Update layout for dark mode
+        bg_color = "#1e1e1e" if dark_mode_enabled else "white"
+        plot_text_color = "#f0f0f0" if dark_mode_enabled else "black"
+
+        fig.update_layout(
+            scene=dict(
+                xaxis=dict(
+                    range=[-1, 1],
+                    backgroundcolor=bg_color,
+                    gridcolor="#444444",
+                    zerolinecolor="#666666",
+                    showbackground=True,
+                    showgrid=True,
+                    showticklabels=False,
+                ),
+                yaxis=dict(
+                    range=[-1, 1],
+                    backgroundcolor=bg_color,
+                    gridcolor="#444444",
+                    zerolinecolor="#666666",
+                    showbackground=True,
+                    showgrid=True,
+                    showticklabels=False,
+                ),
+                zaxis=dict(
+                    range=[-1, 1],
+                    backgroundcolor=bg_color,
+                    gridcolor="#444444",
+                    zerolinecolor="#666666",
+                    showbackground=True,
+                    showgrid=True,
+                    showticklabels=False,
+                ),
+                aspectmode="cube",
+            ),
+            margin=dict(l=0, r=160, b=0, t=30),  # make room on the right
+            legend=dict(
+                x=0.02,  # near left edge of the plotting area
+                y=0.98,  # top
+                bgcolor=(
+                    "rgba(255,255,255,0.7)"
+                    if not dark_mode_enabled
+                    else "rgba(45,45,45,0.7)"
+                ),
+                font=dict(color=plot_text_color),
+            ),
+            paper_bgcolor=bg_color,
+            plot_bgcolor=bg_color,
+            font=dict(color=plot_text_color),
+        )
+        return fig
+
+    # ---------------------------------------------------------
+    #  Helper: build the Top Regions Bar Graph for current slot
+    # ---------------------------------------------------------
+    def build_top_regions_fig(current_slot_regions, title, x_title, dark_mode_enabled):
+        template = "plotly_dark" if dark_mode_enabled else "plotly_white"
+        plot_text_color = "#f0f0f0" if dark_mode_enabled else "black"
+
+        # Prepare data for the bar chart
+        regions = [item[0] for item in current_slot_regions]
+        counts = [item[1] for item in current_slot_regions]
+
+        fig = go.Figure(go.Bar(
+            x=regions,
+            y=counts,
+            marker_color='lightblue' if not dark_mode_enabled else 'rgb(90, 160, 230)' # Example color
+        ))
+
+        fig.update_layout(
+            title=title,
+            margin=dict(l=10, r=10, t=30, b=20),
+            template=template,
+            font=dict(color=plot_text_color),
+            xaxis=dict(
+                title=x_title,
+                gridcolor="#444444" if dark_mode_enabled else "#e0e0e0",
+                showgrid=True,
+                tickangle=-45 # Angle labels for better readability if many regions
+            ),
+            yaxis=dict(
+                title="Number of Validators",
+                gridcolor="#444444" if dark_mode_enabled else "#e0e0e0",
+                showgrid=True,
+            ),
+            bargap=0.2 # Space between bars
+        )
+        return fig
+
+    # ---------------------------------------------------------
+    #  3.  Build the Dash app & layout
+    # ---------------------------------------------------------
+    app = dash.Dash(__name__, external_stylesheets=["/assets/styles.css"])
+
+    app.layout = html.Div(
+        [
+            # -------- control strip --------------------------
+            html.Div(
+                [
+                    html.Button(
+                        "⏵ Play",
+                        id="play-btn",
+                        n_clicks=0,
+                        style={"marginRight": "6px"},
+                    ),
+                    html.Button(
+                        "⏸ Pause",
+                        id="pause-btn",
+                        n_clicks=0,
+                        style={"marginRight": "18px"},
+                    ),
+                    dcc.Dropdown(
+                        id="step-size",
+                        options=[
+                            {"label": f"{k} slot", "value": k} for k in (1, 10, 50)
+                        ],
+                        value=1,
+                        clearable=False,
+                        style={
+                            "width": 110,
+                            "display": "inline-block",
+                            "marginRight": "18px",
+                        },
+                        className="dash-dropdown",  # Add a class for CSS targeting
+                    ),
+                    # wrap the slider in a div; give *that* div flex-1
+                    html.Div(
+                        dcc.Slider(
+                            id="slot-slider",
+                            min=0,
+                            max=max(n_slots - 1, 0),
+                            value=0,
+                            step=1,
+                            marks={
+                                i: str(i)
+                                for i in range(0, n_slots, max(1, n_slots // 10))
+                            },
+                            tooltip={"placement": "bottom"},
+                            className="rc-slider",  # Add a class for CSS targeting
+                        ),
+                        style={"flex": 1},
+                    ),
+                    html.Button(
+                        "🌓 Switch",  # New button for theme toggle
+                        id="theme-toggle-btn",
+                        n_clicks=0,
+                        style={"marginLeft": "18px"},
+                    ),
+                ],
+                style={
+                    "display": "flex",
+                    "alignItems": "center",
+                    "padding": "8px 14px",
+                },
+            ),
+            # --- full-width info bar -------------------------
+            html.Div(
+                id="slot-info-display",
+                className="card",  # Apply card class here
+                style={
+                    # "width": "100%",
+                    "padding": "12px 24px",
+                    # "margin": "8px 16px", # Handled by .card
+                    # "backgroundColor": "#f5f5f5", # Handled by CSS
+                    # "borderRadius": "8px", # Handled by CSS
+                    # "boxShadow": "0 1px 4px rgba(0,0,0,0.1)", # Handled by CSS
+                    "display": "flex",
+                    "justifyContent": "space-around",
+                    "alignItems": "center",
+                    # "fontFamily": "Arial, sans-serif", # Handled by body
+                },
+            ),
+            # -------- card grid ------------------------------
+            # --- first row: full-width globe  -----------------------
+            html.Div(
+                dcc.Graph(
+                    id="density-graph",
+                ),
+                style={
+                    "padding": "20px 16px",
+                    "gridColumn": "1 / -1",  # span all columns
+                    # "height": "600px",  # make it taller if you like
+                    # "height": "calc(100vh - 200px)",  # full height minus controls
+                    "marginTop": "12px",
+                },
+                className="card",
+            ),
+            # --- second row: plots ------------
+            html.Div(
+                [
+                    html.Div(dcc.Graph(id="clusters-line"), className="card"),
+                    html.Div(dcc.Graph(id="totaldist-line"), className="card"),
+                    html.Div(dcc.Graph(id="avg-nnd-line"), className="card"),
+                    html.Div(dcc.Graph(id="nni-line"), className="card"),
+                    html.Div(dcc.Graph(id="mev-line"), className="card"),
+                    html.Div(dcc.Graph(id="attest-line"), className="card"),
+                    html.Div(dcc.Graph(id="failed-block"), className="card"),
+                    html.Div(dcc.Graph(id="proposal-time-line"), className="card"),
+                    html.Div(dcc.Graph(id="relay-dist-line"), className="card"),
+                    html.Div(dcc.Graph(id="top-regions-line"), className="card"),
+                    html.Div(dcc.Graph(id="top-countries-line"), className="card"),
+                ],
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "repeat(auto-fit, minmax(300px, 1fr))",
+                    "gap": "12px",
+                    "padding": "20px 16px",
+                },
+            ),
+            # -------- hidden helpers -------------------------
+            dcc.Interval(id="play-interval", interval=500, disabled=True),
+            dcc.Store(id="movie-state", data={"slot": 0, "playing": False}),
+            dcc.Store(
+                id="theme-state", data={"dark_mode": False}
+            ),  # Store to keep track of the current theme
+        ],
+        id="main-app-container",  # Assign an ID to the main container
+    )
+
+    # ---------------------------------------------------------
+    #  4.  Animation controller (Play / Pause / slider / step)
+    # ---------------------------------------------------------
+    @app.callback(
+        Output("movie-state", "data"),
+        Output("slot-slider", "value"),
+        Output("play-interval", "disabled"),
+        Input("play-btn", "n_clicks"),
+        Input("pause-btn", "n_clicks"),
+        Input("slot-slider", "value"),
+        Input("play-interval", "n_intervals"),
+        Input("step-size", "value"),
+        State("movie-state", "data"),
+        prevent_initial_call=True,
+    )
+    def movie_controller(
+        play_clicks, pause_clicks, slider_val, n_ticks, step_sz, state
+    ):
+
+        trig = dash.callback_context.triggered_id
+
+        if trig == "play-btn":
+            state["playing"] = True
+        elif trig == "pause-btn":
+            state["playing"] = False
+        elif trig == "slot-slider":
+            state["slot"] = slider_val
+            state["playing"] = False  # dragging pauses
+        elif trig == "play-interval" and state["playing"]:
+            state["slot"] = (state["slot"] + step_sz) % n_slots
+
+        return state, state["slot"], not state["playing"]
+
+    # ---------------------------------------------------------
+    #  5.  Theme Toggle Callback
+    # ---------------------------------------------------------
+    @app.callback(
+        Output(
+            "main-app-container", "className"
+        ),  # Update the class of the main container
+        Output("theme-state", "data"),  # Update the stored theme state
+        Input("theme-toggle-btn", "n_clicks"),
+        State("theme-state", "data"),
+        prevent_initial_call=True,
+    )
+    def toggle_theme(n_clicks, theme_data):
+        if n_clicks:
+            new_mode = not theme_data["dark_mode"]
+            theme_data["dark_mode"] = new_mode
+            if new_mode:
+                return "dark-mode", theme_data  # Add 'dark-mode' class
+            else:
+                return "", theme_data  # Remove 'dark-mode' class
+        return "", theme_data  # Default to light mode on initial load
+
+    # ---------------------------------------------------------
+    #  6.  Redraw everything when slot changes (or theme changes)
+    # ---------------------------------------------------------
+    @app.callback(
+        Output("density-graph", "figure"),
+        Output("clusters-line", "figure"),
+        Output("totaldist-line", "figure"),
+        Output("avg-nnd-line", "figure"),
+        Output("nni-line", "figure"),
+        Output("mev-line", "figure"),
+        Output("attest-line", "figure"),
+        Output("failed-block", "figure"),
+        Output("proposal-time-line", "figure"),
+        Output("relay-dist-line", "figure"),
+        Output("top-regions-line", "figure"),
+        Output("top-countries-line", "figure"),
+        Output("slot-info-display", "children"),
+        Input("movie-state", "data"),
+        Input("theme-state", "data"),  # Add theme state as an input
+    )
+    def redraw(state, theme_data):
+        idx = state["slot"]
+        x = list(range(idx + 1))
+
+        dark_mode_enabled = theme_data["dark_mode"]
+
+        # Define Plotly template based on the current theme
+        template = "plotly_dark" if dark_mode_enabled else "plotly_white"
+        plot_text_color = "#f0f0f0" if dark_mode_enabled else "black"
+
+        # -- 3-D view (card 1) --
+        fig3d = build_density_fig(
+            all_slot_data[idx], info_data[idx], dark_mode_enabled
+        )
+        fig3d.update_layout(
+            title=f"Geo Tracker", margin=dict(l=15, r=10, b=20, t=40), template=template
+        )
+
+        # spatial metrics
+        def mkline(data, title):
+            f = go.Figure(go.Scatter(x=x, y=data[: idx + 1], mode="lines"))
+            f.update_layout(
+                title=title,
+                margin=dict(l=10, r=10, t=30, b=20),
+                template=template,  # Apply template here
+                font=dict(
+                    color=plot_text_color
+                ),  # Set font color for plot title/labels
+                xaxis=dict(
+                    gridcolor="#444444" if dark_mode_enabled else "#e0e0e0",
+                    showgrid=True,
+                ),  # Adjust grid color
+                yaxis=dict(
+                    gridcolor="#444444" if dark_mode_enabled else "#e0e0e0",
+                    showgrid=True,
+                ),  # Adjust grid color
+            )
+            return f
+
+        fig_c = mkline(clusters_hist, "Clusters")
+        fig_t = mkline(total_dist_hist, "Total Distance")
+        fig_a = mkline(avg_nnd_hist, "Avg NND")
+        fig_n = mkline(nni_hist, "NNI")
+        fig_mev = mkline(mev_hist, "MEV Earned")
+        fig_attest = mkline(attest_hist, "Attestation Rate %")
+        fig_failed_block = mkline(
+            failed_block_proposals, "Failed Block Proposals"
+        )
+        fig_proposal_time = mkline(proposal_time_hist, "Proposal Time (s)")
+        
+        fig_relay_dist = go.Figure()
+        # Check if there's any relay distance data to plot
+        if relay_dist and relay_dist[idx]:
+            num_relays = len(relay_dist[idx])
+            for i, relay_name in zip(range(num_relays), info_names):
+                # Extract the history for the i-th relay up to the current slot
+                relay_y_data = [slot_data[i] for slot_data in relay_dist[: idx + 1] if i < len(slot_data)]
+                fig_relay_dist.add_trace(
+                    go.Scatter(x=x, y=relay_y_data, mode="lines", name=relay_name)
+                )
+
+        fig_relay_dist.update_layout(
+            title="Avg Distance to Info Sources",
+            margin=dict(l=10, r=10, t=30, b=20),
+            template=template,
+            font=dict(color=plot_text_color),
+            xaxis=dict(title="Slot", gridcolor="#444444" if dark_mode_enabled else "#e0e0e0", showgrid=True),
+            yaxis=dict(title="Avg. Distance", gridcolor="#444444" if dark_mode_enabled else "#e0e0e0", showgrid=True),
+            legend=dict(
+                orientation="h",
+                yanchor="top",
+                y=-0.2,
+                xanchor="center",
+                x=0.5 
+            )
+        )
+
+        # New: Top Regions Graph
+        fig_top_regions = build_top_regions_fig(validator_agent_regions.get(str(idx), [])[:15], "Top Validator Cloud Regions", "Region", dark_mode_enabled)
+        fig_top_countries = build_top_regions_fig(validator_agent_countries.get(str(idx), [])[:15], "Top Validator Countries", "Country", dark_mode_enabled)
+
+        # Info display text color
+        info_text_color = "#f0f0f0" if dark_mode_enabled else "black"
+
+        info = html.Div(
+            [
+                html.Span(
+                    f"Slot {idx+1}",
+                    style={
+                        "fontWeight": "bold",
+                        "marginRight": "24px",
+                        "color": info_text_color,
+                    },
+                ),
+                html.Span(
+                    f"Clusters: {clusters_hist[idx]}",
+                    style={"marginRight": "24px", "color": info_text_color},
+                ),
+                html.Span(
+                    f"Total Distance: {total_dist_hist[idx]:.4f}",
+                    style={"marginRight": "24px", "color": info_text_color},
+                ),
+                html.Span(
+                    f"Avg NND: {avg_nnd_hist[idx]:.4f}",
+                    style={"marginRight": "24px", "color": info_text_color},
+                ),
+                html.Span(
+                    f"NNI: {nni_hist[idx]:.4f}",
+                    style={"marginRight": "24px", "color": info_text_color},
+                ),
+                html.Span(
+                    f"MEV Earned: {mev_hist[idx]:.4f}",
+                    style={"marginRight": "24px", "color": info_text_color},
+                ),
+                html.Span(
+                    f"Attestation Rate: {attest_hist[idx]:.2f}%",
+                    style={"marginRight": "24px", "color": info_text_color},
+                ),
+                html.Span(
+                    f"Proposal Time: {proposal_time_hist[idx]:.2f} ms",
+                    style={"color": info_text_color},
+                ),
+            ],
+            style={
+                "display": "flex",
+                "flexWrap": "wrap",
+                "justifyContent": "space-around",
+                "alignItems": "center",
+                # "fontFamily": "Arial, sans-serif", # Handled by body CSS
+                # Background and shadow are handled by the 'card' class
+            },
+        )
+
+        return (
+            fig3d,
+            fig_c,
+            fig_t,
+            fig_a,
+            fig_n,
+            fig_mev,
+            fig_attest,
+            fig_failed_block,
+            fig_proposal_time,
+            fig_relay_dist,
+            fig_top_regions,
+            fig_top_countries,
+            info,
+        )
+
+    return app
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the simulation viewer.")
+    parser.add_argument(
+        "--data-dir",
+        "-d",
+        type=str,
+        default="data",
+        help="Path to the slot data folder.",
+    )   
+    parser.add_argument(
+        "--output-dir",
+        "-o",
+        type=str,
+        default="default-simulation",
+        help="Output directory where simulation results are stored.",
+    )
+    parser.add_argument(
+        "--port",
+        "-p",
+        type=int,
+        default=8050,
+        help="Port to run the Dash app on.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="SSP",
+        choices=["SSP", "MSP"],
+        help="Model type used in the simulation (SSP or MSP).",
+    )
+    args = parser.parse_args()
+    
+
+    data_path = args.data_dir
+    mev_series = load_data(f"{args.output_dir}/mev_by_slot.json")
+    attest_series = load_data(f"{args.output_dir}/attest_by_slot.json")
+    failed_block_proposals = load_data(f"{args.output_dir}/failed_block_proposals.json")
+    proposal_time_series = load_data(f"{args.output_dir}/proposal_time_by_slot.json")
+
+    validator_agent_regions = load_data(f"{args.output_dir}/region_counter_per_slot.json")
+    validator_agent_countries = {}
+    region_df = pd.read_csv(f"{data_path}/gcp_regions.csv")
+    region_to_country = {}
+    region_to_xyz = {}
+    for region, city in zip(region_df["Region"], region_df["location"]):
+        region_to_country[region] = city.split(",")[-1].strip() if "," in city else city.strip()
+    for region, x, y, z in zip(region_df["Region"], region_df["x"], region_df["y"], region_df["z"]):
+        region_to_xyz[region] = (x, y, z)
+    
+    all_slot_data = []
+    for slot, region_list in sorted(validator_agent_regions.items(), key=lambda x: int(x[0])):
+        country_counter = defaultdict(int)
+        slot_data = []
+
+        for region, count in region_list:
+            country = region_to_country.get(region, "Unknown")
+            country_counter[country] += count
+            xyz = region_to_xyz.get(region, (0.0, 0.0, 0.0))
+            slot_data.extend([xyz] * count)
+    
+        validator_agent_countries[slot] = Counter(country_counter).most_common()
+        all_slot_data.append(slot_data)
+
+    relay_names = load_data(f"{args.output_dir}/relay_names.json")
+    signal_names = load_data(f"{args.output_dir}/signal_names.json")
+    if args.model == "SSP":
+        info_names = [i[0] for i in relay_names]
+        info_data = [region_to_xyz.get(i[1], (0.0, 0.0, 0.0)) for i in relay_names]
+    else:  # MSP
+        info_names = [i[0] for i in signal_names]
+        info_data = [region_to_xyz.get(i[1], (0.0, 0.0, 0.0)) for i in signal_names]
+    
+    info_data = [info_data] * len(all_slot_data)  # replicate for each slot
+
+    if not all_slot_data:
+        print("Application cannot start because data is missing.")
+        exit(1)
+    else:
+        app = create_app(
+            all_slot_data, info_data, mev_series, attest_series, failed_block_proposals, proposal_time_series, validator_agent_regions, validator_agent_countries, info_names
+        )
+        app.run(debug=True, port=args.port)
