@@ -243,7 +243,8 @@ def single_line(ax: plt.Axes, data_df: pd.DataFrame, x_col: str, y_col: str, hue
     )
     ax.set_xlabel(xlabel, fontsize=40)
     ax.set_ylabel(ylabel, fontsize=40)
-    ax.set_xlim(0, data_df[x_col].max()+1)
+    if xlabel == "Slot":
+        ax.set_xlim(0, data_df[x_col].max()+1)
     if xlabel is not None:
         ax.tick_params(axis="x", labelsize=36)
     else:
@@ -251,9 +252,15 @@ def single_line(ax: plt.Axes, data_df: pd.DataFrame, x_col: str, y_col: str, hue
     ax.tick_params(axis="y", labelsize=36)
 
 
-def plot_comparision(folder_paths, names, output_path):
+def plot_comparision(folder_paths, names, output_path, figsize=(25, 12), desired_order=None, normalized=False, ncol=None, columnspacing=None, h_offset=0.04):
     total_metrcis = []
     total_profits = []
+
+    if ncol is None:
+        ncol = len(names)//2 if len(names) > 2 else 2
+
+    if columnspacing is None:
+        columnspacing = round(10.5-1.25*len(names), 1)
 
     for folder_path, name in zip(folder_paths, names):
         folder_path = Path(folder_path)
@@ -268,6 +275,10 @@ def plot_comparision(folder_paths, names, output_path):
         continent_metrics["name"] = name
         profits_df["name"] = name
 
+        continent_metrics["normalized_slots"] = continent_metrics["slot"] / continent_metrics["slot"].max() if normalized else continent_metrics["slot"]
+        profits_df["normalized_slots"] = profits_df["slot"] / profits_df["slot"].max() if normalized else profits_df["slot"]
+
+
         total_metrcis.append(continent_metrics)
         total_profits.append(profits_df)
 
@@ -275,38 +286,45 @@ def plot_comparision(folder_paths, names, output_path):
     total_profits_df = pd.concat(total_profits, ignore_index=True)
 
     sns.set_style("whitegrid")
-    fig, axes = plt.subplots(2,2, figsize=(25, 12), sharey=False, sharex=True, dpi=300)
+    fig, axes = plt.subplots(2,2, figsize=figsize, sharey=False, sharex=True, dpi=300)
     axes = axes.flatten()
-    for idx, y, y_label in zip(range(3), ["gini", "liveness", "hhi"], ["Gini$_{g}$",  "LC$_{g}$", "HHI$_{g}$"]):
+    for idx, y, y_label in zip(range(3), ["gini", "liveness", "hhi"], [r"$\mathrm{Gini}_{\mathrm{g}}$",  r"$\mathrm{LC}_{\mathrm{g}}$", r"$\mathrm{HHI}_{\mathrm{g}}$"]):
         single_line(
             axes[idx],
             total_metrics_df,
-            "slot",
+            "slot" if not normalized else "normalized_slots",
             y,
             "name",
             y_label,
             False,
-            "Slot" if idx == 2 else None
+            ("Slot" if not normalized else "Relative Progress") if idx == 2 else None
         )
 
     # cv    
     single_line(
         axes[-1],
         total_profits_df,
-        "slot",
+        "slot" if not normalized else "normalized_slots",
         "cv",
         "name",
-        "CV$_{g}$",
+        r"$\mathrm{CV}_{\mathrm{g}}$",
         True,
-        "Slot"
+        "Slot" if not normalized else "Relative Progress"
     )
 
     plt.subplots_adjust(hspace=0.1, wspace=0.3)
     handles, labels = axes[-1].get_legend_handles_labels()
+
+    label_to_handle = dict(zip(labels, handles))
+    if desired_order is not None:
+        handles = [label_to_handle[label] for label in desired_order]
+        labels = desired_order
+
     axes[-1].legend_.remove()
 
-    fig.legend(handles, labels, loc="upper center", fontsize=40, ncol=len(names)//2, title=None, bbox_to_anchor=(0.5, 1.04), framealpha=0, facecolor="none", edgecolor="none", columnspacing=round(10.5-1.25*len(names), 1))
-    plt.savefig(output_path, bbox_inches="tight")
+
+    fig.legend(handles, labels, loc="upper center", fontsize=40, ncol=ncol, title=None, bbox_to_anchor=(0.5, 1 + h_offset), framealpha=0, facecolor="none", edgecolor="none", columnspacing=columnspacing)
+    plt.savefig(output_path, bbox_inches="tight") 
     plt.close(fig)
 
     
@@ -320,11 +338,16 @@ def plot_baseline(c):
         os.path.join(OUTPUT_DIR, "baseline", "MSP", "validators_1000_slots_10000_cost_0.002"),
     ]
 
-    names = xlabels = [
-        "$c = 0$ (SSP)",
-        "$c = 0.002$ (SSP)",
-        "$c = 0$ (MSP)",
-        "$c = 0.002$ (MSP)",
+    names = [
+        "External",
+        "Local",
+    ]
+
+    xlabels = [
+        "$c = 0$ (External)",
+        "$c = 0.002$ (External)",
+        "$c = 0$ (Local)",
+        "$c = 0.002$ (Local)",
     ]
 
     ylabels = [
@@ -337,7 +360,7 @@ def plot_baseline(c):
     continent_comparision_output_path = os.path.join(FIGURE_DIR, "continent_comparision_baseline.pdf")
     continent_distribution_output_path = os.path.join(FIGURE_DIR, "continent_distribution_baseline.pdf")
 
-    plot_comparision(folder_paths, names, continent_comparision_output_path)
+    plot_comparision([folder_paths[1], folder_paths[3]], names, continent_comparision_output_path, h_offset=0)
     plot_continent_distribution(folder_paths, xlabels, ylabels, continent_distribution_output_path)
     
 
@@ -346,13 +369,19 @@ def plot_cost(c):
     """Generate cost plots."""
     folder_paths = []
     names = []
-    
+
+    label_map = {
+        "SSP" : "External",
+        "MSP" : "Local",
+    }
+
+
     for paradigm in ["SSP", "MSP"]:
         for cost in ["0.0", "0.001", "0.002", "0.003"]:
             folder_paths.append(
                 os.path.join(OUTPUT_DIR, "baseline", paradigm, f"validators_1000_slots_10000_cost_{cost}")
             )
-            names.append(f"$c = {cost}$ ({paradigm})")
+            names.append(f"$c = {cost}$ ({label_map[paradigm]})")
 
 
     continent_comparision_output_path = os.path.join(FIGURE_DIR, "continent_comparision_cost.pdf")
@@ -366,60 +395,95 @@ def plot_heterogeneous_information_sources(c):
     Generate hetero-info plots.
     """
     folder_paths = [
+        os.path.join(OUTPUT_DIR, "baseline", "SSP", "validators_1000_slots_10000_cost_0.002"),
+        os.path.join(OUTPUT_DIR, "baseline", "MSP", "validators_1000_slots_10000_cost_0.002"),
         os.path.join(OUTPUT_DIR, "hetero_info", "SSP", "validators_1000_slots_10000_cost_0.002_latency_latency-aligned"),
-        os.path.join(OUTPUT_DIR, "hetero_info", "SSP", "validators_1000_slots_10000_cost_0.002_latency_latency-misaligned"),
         os.path.join(OUTPUT_DIR, "hetero_info", "MSP", "validators_1000_slots_10000_cost_0.002_latency_latency-aligned"),
+        os.path.join(OUTPUT_DIR, "hetero_info", "SSP", "validators_1000_slots_10000_cost_0.002_latency_latency-misaligned"),
         os.path.join(OUTPUT_DIR, "hetero_info", "MSP", "validators_1000_slots_10000_cost_0.002_latency_latency-misaligned"),
     ]
 
     names = [
-        "latency-aligned (SSP)",
-        "latency-misaligned (SSP)",
-        "latency-aligned (MSP)",
-        "latency-misaligned (MSP)",
+        "baseline (External)",
+        "baseline (Local)",
+        "latency-aligned (External)",
+        "latency-aligned (Local)",
+        "latency-misaligned (External)",
+        "latency-misaligned (Local)",
+    ]
+
+    order = [
+        "baseline (External)",
+        "latency-aligned (External)",
+        "latency-misaligned (External)",
+        "baseline (Local)",
+        "latency-aligned (Local)",
+        "latency-misaligned (Local)",
     ]
 
     continent_comparision_output_path = os.path.join(FIGURE_DIR, "continent_comparision_hetero_info.pdf")
-    plot_comparision(folder_paths, names, continent_comparision_output_path)
+    plot_comparision(folder_paths, names, continent_comparision_output_path, figsize=(25, 13), desired_order=order, ncol=2, columnspacing=2.0, h_offset=0.09)
 
 
 @task
 def plot_heterogeneous_validators(c):
     """Generate hetero-validator plots."""
     folder_paths = [
-        os.path.join(OUTPUT_DIR, "hetero_validators", "SSP", "slots_10000_cost_0.0_validators_heterogeneous"),
+        os.path.join(OUTPUT_DIR, "baseline", "SSP", "validators_1000_slots_10000_cost_0.002"),
+        os.path.join(OUTPUT_DIR, "baseline", "MSP", "validators_1000_slots_10000_cost_0.002"),
         os.path.join(OUTPUT_DIR, "hetero_validators", "SSP", "slots_10000_cost_0.002_validators_heterogeneous"),
-        os.path.join(OUTPUT_DIR, "hetero_validators", "MSP", "slots_10000_cost_0.0_validators_heterogeneous"),
         os.path.join(OUTPUT_DIR, "hetero_validators", "MSP", "slots_10000_cost_0.002_validators_heterogeneous"),
     ]
 
     names = [
-        "$c = 0$ (SSP)",
-        "$c = 0.002$ (SSP)",
-        "$c = 0$ (MSP)",
-        "$c = 0.002$ (MSP)",
+        "baseline (External)",
+        "baseline (Local)",
+        "heterogeneous validators (External)",
+        "heterogeneous validators (Local)",
+    ]
+
+    order = [
+        "baseline (External)",
+        "heterogeneous validators (External)",
+        "baseline (Local)",
+        "heterogeneous validators (Local)",
     ]
 
     continent_comparision_output_path = os.path.join(FIGURE_DIR, "continent_comparision_hetero_validator.pdf")
-    plot_comparision(folder_paths, names, continent_comparision_output_path)
+    plot_comparision(folder_paths, names, continent_comparision_output_path, desired_order=order, ncol=2, columnspacing=2.0)
 
 
 @task
 def plot_hetero_both(c):
     """Generate hetero-both plots."""
     folder_paths = [
+        os.path.join(OUTPUT_DIR, "baseline", "SSP", "validators_1000_slots_10000_cost_0.002"),
+        os.path.join(OUTPUT_DIR, "baseline", "MSP", "validators_1000_slots_10000_cost_0.002"),
         os.path.join(OUTPUT_DIR, "hetero_both", "SSP", "validators_heterogeneous_slots_10000_cost_0.002_latency_latency-aligned"),
-        os.path.join(OUTPUT_DIR, "hetero_both", "SSP", "validators_heterogeneous_slots_10000_cost_0.002_latency_latency-misaligned"),
         os.path.join(OUTPUT_DIR, "hetero_both", "MSP", "validators_heterogeneous_slots_10000_cost_0.002_latency_latency-aligned"),
+        os.path.join(OUTPUT_DIR, "hetero_both", "SSP", "validators_heterogeneous_slots_10000_cost_0.002_latency_latency-misaligned"),
         os.path.join(OUTPUT_DIR, "hetero_both", "MSP", "validators_heterogeneous_slots_10000_cost_0.002_latency_latency-misaligned"),
     ]
 
-    names = xlabels = [
-        "latency-aligned (SSP)",
-        "latency-misaligned (SSP)",
-        "latency-aligned (MSP)",
-        "latency-misaligned (MSP)",
+    names = [
+        "baseline (External)",
+        "baseline (Local)",
+        "latency-aligned (External)",
+        "latency-aligned (Local)",
+        "latency-misaligned (External)",
+        "latency-misaligned (Local)",
     ]
+
+    order = [
+        "baseline (External)",
+        "latency-aligned (External)",
+        "latency-misaligned (External)",
+        "baseline (Local)",
+        "latency-aligned (Local)",
+        "latency-misaligned (Local)",
+    ]
+
+    xlabels = names[2::]
 
     ylabels = [
         "Validator Distribution (%)",
@@ -430,8 +494,8 @@ def plot_hetero_both(c):
 
     continent_comparision_output_path = os.path.join(FIGURE_DIR, "continent_comparision_hetero_both.pdf")
     continent_distribution_output_path = os.path.join(FIGURE_DIR, "continent_distribution_hetero_both.pdf")
-    plot_comparision(folder_paths, names, continent_comparision_output_path)
-    plot_continent_distribution(folder_paths, xlabels, ylabels, continent_distribution_output_path)
+    plot_comparision(folder_paths, names, continent_comparision_output_path, figsize=(25, 13), desired_order=order, ncol=2, columnspacing=2.0, h_offset=0.09)
+    plot_continent_distribution(folder_paths[2:6], xlabels, ylabels, continent_distribution_output_path)
 
 
 @task
@@ -448,7 +512,8 @@ def plot_different_gammas(c):
         os.path.join(OUTPUT_DIR, "different_gammas", "MSP", "validators_1000_slots_10000_cost_0.002_gamma_0.8"),
     ]
 
-    names = [r"$\gamma=1/3$ (SSP)", r"$\gamma=1/2$ (SSP)", r"$\gamma=2/3$ (SSP)", r"$\gamma=4/5$ (SSP)", r"$\gamma=1/3$ (MSP)", r"$\gamma=1/2$ (MSP)", r"$\gamma=2/3$ (MSP)", r"$\gamma=4/5$ (MSP)"]
+    names = [r"$\gamma=1/3$ (External)", r"$\gamma=1/2$ (External)", r"$\gamma=2/3$ (External)", r"$\gamma=4/5$ (External)",
+             r"$\gamma=1/3$ (Local)", r"$\gamma=1/2$ (Local)", r"$\gamma=2/3$ (Local)", r"$\gamma=4/5$ (Local)"]
 
     continent_comparision_output_path = os.path.join(FIGURE_DIR, "continent_comparision_gamma.pdf")
     plot_comparision(folder_paths, names, continent_comparision_output_path)
@@ -465,12 +530,39 @@ def plot_eip7782(c):
     ]
 
     names = [
-        r"$\Delta=12s$ (SSP)",
-        r"$\Delta=6s$ (SSP)",
-        r"$\Delta=12s$ (MSP)",
-        r"$\Delta=6s$ (MSP)"
+        r"$\Delta=12s$ (External)",
+        r"$\Delta=6s$ (External)",
+        r"$\Delta=12s$ (Local)",
+        r"$\Delta=6s$ (Local)"
     ]
 
     continent_comparision_output_path = os.path.join(FIGURE_DIR, "continent_comparision_eip7782.pdf")
 
     plot_comparision(folder_paths, names, continent_comparision_output_path)
+
+
+@task
+def plot_different_scale(c):
+    """Generate different scale plots."""
+
+    folder_paths = [
+        os.path.join(OUTPUT_DIR, "baseline", "SSP", "validators_100_slots_1000_cost_0.0"),
+        os.path.join(OUTPUT_DIR, "baseline", "SSP", "validators_1000_slots_10000_cost_0.0"),
+        os.path.join(OUTPUT_DIR, "baseline", "SSP", "validators_10000_slots_100000_cost_0.0"),
+        os.path.join(OUTPUT_DIR, "baseline", "MSP", "validators_100_slots_1000_cost_0.0"),
+        os.path.join(OUTPUT_DIR, "baseline", "MSP", "validators_1000_slots_10000_cost_0.0"),
+        os.path.join(OUTPUT_DIR, "baseline", "MSP", "validators_10000_slots_100000_cost_0.0"),
+    ]
+
+    names = [
+        r"$|\mathcal{V}| = 100$ (External)",
+        r"$|\mathcal{V}| = 1,000$ (External)",
+        r"$|\mathcal{V}| = 10,000$ (External)",
+        r"$|\mathcal{V}| = 100$ (Local)",
+        r"$|\mathcal{V}| = 1,000$ (Local)",
+        r"$|\mathcal{V}| = 10,000$ (Local)",
+    ]
+
+    continent_comparision_output_path = os.path.join(FIGURE_DIR, "continent_comparision_different_scale.pdf")
+
+    plot_comparision(folder_paths, names, continent_comparision_output_path, figsize=(25, 13), normalized=True, ncol=2, columnspacing=2.0, h_offset=0.09)

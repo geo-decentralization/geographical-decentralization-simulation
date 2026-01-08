@@ -1,6 +1,6 @@
 # 🌍 Geographical Decentralization Simulation
 
-This repository contains the simulation and evaluation code for the paper "Designing Ethereum’s Geographical (De)Centralization Beyond the Atlantic".
+This repository contains the simulation and evaluation code for the paper "Geographical Centralization Resilience in Ethereum's Block-Building Paradigms".
 
 ## Installation
 
