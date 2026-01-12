@@ -153,9 +153,9 @@ def figure_country_density_plus_continent_latency(
     lat["A"] = lat["sending_region"].map(cont_map)
     lat["B"] = lat["receiving_region"].map(cont_map)
 
-    # undirected continent pairs (mean ms)
+    # undirected continent pairs (median ms)
     lat["pair"] = lat.apply(lambda r: tuple(sorted([r["A"], r["B"]])), axis=1)
-    edges = lat.groupby("pair")["milliseconds"].mean().reset_index()
+    edges = lat.groupby("pair")["milliseconds"].median().reset_index()
     edges[["c1", "c2"]] = pd.DataFrame(edges["pair"].tolist(), index=edges.index)
     edges_inter = edges[edges["c1"] != edges["c2"]].copy()
 
