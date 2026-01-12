@@ -329,7 +329,7 @@ def figure_country_density_plus_continent_latency(
         pad=0.02,
         shrink=0.58,
     )
-    cbar_lat.set_label("Average Latency (ms)", fontsize=20)
+    cbar_lat.set_label("Median Latency (ms)", fontsize=20)
     cbar_lat.ax.tick_params(labelsize=20)
 
     # Country density: bottom
